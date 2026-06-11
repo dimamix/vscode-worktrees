@@ -3,6 +3,7 @@
 const vscode = require('vscode');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
+const fs = require('fs');
 const path = require('path');
 
 const execFileAsync = promisify(execFile);
@@ -45,12 +46,22 @@ async function processCwd(terminal) {
   return undefined;
 }
 
-// All known cwd sources, most-trustworthy first. The OS leads (shell
-// integration goes stale on revived/TUI terminals), but it reports physical
-// paths — a workspace opened through a symlink only matches the logical path
-// shell integration reports, so the caller tries each in order.
+// All known cwd sources, most-trustworthy first. Shell integration leads:
+// it updates at every prompt render, follows nested shells (nix develop,
+// subshells) the OS lookup cannot see, and reports logical (symlink-aware)
+// paths. Deliberate trade-off, not an accident of ordering: when present,
+// integration's value stays correct under a TUI (a TUI never changes the
+// shell's cwd) and across window reloads (the processes survive), whereas
+// the OS lookup only sees the ROOT shell — provably wrong under nested
+// shells. The OS cwd covers terminals where integration never attached and
+// is consulted whenever integration maps outside every workspace folder;
+// the static creation cwd is the last resort.
 async function cwdCandidates(terminal) {
   const candidates = [];
+  const integrationCwd = terminal.shellIntegration && terminal.shellIntegration.cwd;
+  if (integrationCwd) {
+    candidates.push({ cwd: integrationCwd, source: 'shell integration' });
+  }
   try {
     const osCwd = await processCwd(terminal);
     if (osCwd) {
@@ -58,10 +69,6 @@ async function cwdCandidates(terminal) {
     }
   } catch (err) {
     log(`OS cwd lookup failed: ${err && err.message}`);
-  }
-  const integrationCwd = terminal.shellIntegration && terminal.shellIntegration.cwd;
-  if (integrationCwd) {
-    candidates.push({ cwd: integrationCwd, source: 'shell integration' });
   }
   const created = terminal.creationOptions && terminal.creationOptions.cwd;
   if (created) {
@@ -134,12 +141,48 @@ async function followTerminal(terminal, reason) {
     log(`(${reason}) no cwd resolvable for terminal "${terminal.name}"`);
     return;
   }
+  // Candidates group by the physical directory they name; groups keep
+  // source order, so a fresher source's directory is preferred and a later
+  // group is only a fallback when earlier ones map to no workspace folder.
+  // Within a group (symlinked aliases of one directory), the match with the
+  // fewest path segments between folder root and cwd wins — 0 means the cwd
+  // IS that root. Path-string length is meaningless across alias namespaces.
+  const physicalPath = (p) => {
+    try {
+      return fs.realpathSync.native(p);
+    } catch {
+      return p;
+    }
+  };
+  const relativeDepth = (cwd, folderUri) =>
+    cwd.fsPath.slice(folderUri.fsPath.length).split(path.sep).filter(Boolean).length;
+  const groups = [];
+  for (const candidate of candidates) {
+    const physical = physicalPath(candidate.cwd.fsPath);
+    let group = groups.find((g) => g.physical === physical);
+    if (!group) {
+      group = { physical, members: [] };
+      groups.push(group);
+    }
+    group.members.push(candidate);
+  }
   let folder;
   let resolved;
-  for (const candidate of candidates) {
-    folder = workspaceFolderFor(candidate.cwd);
+  let bestDepth = Infinity;
+  for (const group of groups) {
+    for (const member of group.members) {
+      const match = workspaceFolderFor(member.cwd);
+      if (!match) {
+        continue;
+      }
+      const depth = relativeDepth(member.cwd, match.uri);
+      if (!folder || depth < bestDepth) {
+        folder = match;
+        resolved = member;
+        bestDepth = depth;
+      }
+    }
     if (folder) {
-      resolved = candidate;
       break;
     }
   }
@@ -213,16 +256,25 @@ async function addWorktreesToWorkspace() {
 
   // Compare normalized Uris, not raw paths: on Windows git emits forward
   // slashes while fsPath uses backslashes, and one duplicate would make
-  // updateWorkspaceFolders reject the whole batch.
-  const known = new Set(folders.map((f) => f.uri.toString()));
-  const discovered = new Set();
+  // updateWorkspaceFolders reject the whole batch. Case-fold the comparison
+  // key on case-insensitive platforms — Uri normalizes the drive letter but
+  // preserves component casing.
+  const compareKey = (uri) =>
+    process.platform === 'win32' || process.platform === 'darwin'
+      ? uri.toString().toLowerCase()
+      : uri.toString();
+  const known = new Set(folders.map((f) => compareKey(f.uri)));
+  const discovered = new Map();
   for (const folder of folders) {
     for (const worktree of await listWorktrees(folder)) {
-      discovered.add(vscode.Uri.file(worktree).toString());
+      const uri = vscode.Uri.file(worktree);
+      discovered.set(compareKey(uri), uri.toString());
     }
   }
 
-  const toAdd = [...discovered].filter((uri) => !known.has(uri));
+  const toAdd = [...discovered.entries()]
+    .filter(([key]) => !known.has(key))
+    .map(([, uri]) => uri);
   if (toAdd.length === 0) {
     vscode.window.showInformationMessage('All worktrees are already workspace folders.');
     return;

@@ -2,12 +2,12 @@
 
 ## 0.1.2
 
-- Fix: resolve the workspace folder by explicit longest-prefix match so nested worktree roots (e.g. `<repo>/.worktrees/*`) win over the containing repo root.
-- Fix: prefer the OS-reported shell cwd over shell integration's, which can be stale for revived terminals or terminals running a TUI.
-- Fix (review): guard against overlapping follow operations on rapid terminal switches with a generation counter.
-- Fix (review): compare normalized URIs when adding worktrees so Windows path separators can't produce duplicates that void the whole update.
-- Fix (review): expand folders containing only dotfiles by falling back to a hidden child (except `.git`).
-- Log every follow decision, including suppressed same-folder switches.
+- Fix: resolve the workspace folder by explicit longest-prefix match (case-folded on macOS/Windows, root-folder safe) so nested worktree roots (e.g. `<repo>/.worktrees/*`) win over the containing repo root.
+- Fix: resolve the terminal's cwd from multiple sources — shell integration first, then the OS-reported shell cwd (`lsof` on macOS, `/proc` on Linux), then the creation cwd — grouped by physical directory so symlinked aliases deepen a match by relative depth but a stale source naming a different directory only serves as fallback.
+- Fix (review): a generation counter cancels overlapping follows on rapid terminal switches (including switches to no terminal), and the same-folder guard is only recorded after a reveal fully completes.
+- Fix (review): normalized, case-folded URI comparison when adding worktrees, so Windows separators or casing can't produce a duplicate that voids the whole update.
+- Fix (review): folders containing only dotfiles expand via a hidden child (except `.git`).
+- Log every follow decision — including suppressed same-folder switches — with the cwd source.
 
 ## 0.1.1
 
