@@ -9,6 +9,9 @@ const execFileAsync = promisify(execFile);
 
 let output;
 let lastRevealedFolder;
+// Rapid terminal switches overlap in followTerminal's awaits; only the
+// newest invocation is allowed to touch the Explorer or focus.
+let followGeneration = 0;
 
 function log(message) {
   if (output) {
@@ -20,8 +23,9 @@ function followConfig() {
   return vscode.workspace.getConfiguration('worktrees.follow');
 }
 
-// The shell's cwd as the OS sees it. Works even when shell integration is
-// silent (e.g. a TUI has been running since before integration attached).
+// The shell's cwd as the OS sees it — ground truth. Shell integration's cwd
+// can be stale: terminals revived after a window reload, or a TUI running
+// since before integration attached, keep reporting an old directory.
 async function processCwd(terminal) {
   const pid = await terminal.processId;
   if (!pid) {
@@ -42,25 +46,42 @@ async function processCwd(terminal) {
 }
 
 async function terminalCwd(terminal) {
-  const integrationCwd = terminal.shellIntegration && terminal.shellIntegration.cwd;
-  if (integrationCwd) {
-    return integrationCwd;
-  }
-  log('shell integration cwd unavailable; querying the OS');
   try {
     const osCwd = await processCwd(terminal);
     if (osCwd) {
-      return osCwd;
+      return { cwd: osCwd, source: 'os' };
     }
   } catch (err) {
     log(`OS cwd lookup failed: ${err && err.message}`);
   }
+  const integrationCwd = terminal.shellIntegration && terminal.shellIntegration.cwd;
+  if (integrationCwd) {
+    return { cwd: integrationCwd, source: 'shell integration' };
+  }
   // Last resort: the (static) cwd the terminal was created with.
   const created = terminal.creationOptions && terminal.creationOptions.cwd;
   if (created) {
-    return typeof created === 'string' ? vscode.Uri.file(created) : created;
+    return {
+      cwd: typeof created === 'string' ? vscode.Uri.file(created) : created,
+      source: 'creation options',
+    };
   }
   return undefined;
+}
+
+// Explicit longest-prefix match over workspace folders. With nested roots —
+// a repo plus its worktrees under <repo>/.worktrees/ — the innermost folder
+// must win, and this must not depend on getWorkspaceFolder's tie-breaking.
+function workspaceFolderFor(uri) {
+  const target = uri.fsPath + path.sep;
+  let best;
+  for (const folder of vscode.workspace.workspaceFolders || []) {
+    const prefix = folder.uri.fsPath + path.sep;
+    if (target.startsWith(prefix) && (!best || prefix.length > best.uri.fsPath.length + 1)) {
+      best = folder;
+    }
+  }
+  return best;
 }
 
 // Revealing a folder only selects it; revealing something inside it is what
@@ -68,12 +89,14 @@ async function terminalCwd(terminal) {
 async function expandTarget(cwd) {
   try {
     const entries = await vscode.workspace.fs.readDirectory(cwd);
-    const visible = entries
-      .map(([name]) => name)
-      .filter((name) => !name.startsWith('.'))
-      .sort();
-    if (visible.length > 0) {
-      return vscode.Uri.joinPath(cwd, visible[0]);
+    const names = entries.map(([name]) => name).sort();
+    const pick =
+      names.find((name) => !name.startsWith('.')) ||
+      // Dotfile fallback for hidden-only dirs; .git stays out because the
+      // Explorer hides it by default and won't reveal it.
+      names.find((name) => name !== '.git' && name !== '.DS_Store');
+    if (pick) {
+      return vscode.Uri.joinPath(cwd, pick);
     }
   } catch (err) {
     log(`readDirectory failed for ${cwd.fsPath}: ${err && err.message}`);
@@ -82,33 +105,44 @@ async function expandTarget(cwd) {
 }
 
 async function followTerminal(terminal, reason) {
-  if (!followConfig().get('enabled', true) || !terminal) {
+  if (!terminal || !followConfig().get('enabled', true)) {
     return;
   }
-  const cwd = await terminalCwd(terminal);
-  if (!cwd) {
+  const generation = ++followGeneration;
+  const resolved = await terminalCwd(terminal);
+  if (generation !== followGeneration) {
+    return;
+  }
+  if (!resolved) {
     log(`(${reason}) no cwd resolvable for terminal "${terminal.name}"`);
     return;
   }
-  const folder = vscode.workspace.getWorkspaceFolder(cwd);
+  const folder = workspaceFolderFor(resolved.cwd);
+  log(
+    `(${reason}) "${terminal.name}" cwd ${resolved.cwd.fsPath} [${resolved.source}] -> ` +
+      (folder ? `workspace folder "${folder.name}"` : 'no workspace folder')
+  );
   if (!folder) {
-    log(`(${reason}) cwd ${cwd.fsPath} is not inside any workspace folder`);
     return;
   }
   // Re-revealing within the same root would collapse trees the user
   // expanded by hand, so only act when the terminal's root changes.
   if (folder.uri.toString() === lastRevealedFolder) {
+    log(`(${reason}) already on "${folder.name}"; nothing to do`);
     return;
   }
   lastRevealedFolder = folder.uri.toString();
-  log(`(${reason}) cwd ${cwd.fsPath} -> revealing workspace folder "${folder.name}"`);
 
   if (followConfig().get('collapseOthers', true)) {
     await vscode.commands.executeCommand('workbench.files.action.collapseExplorerFolders');
   }
-  await vscode.commands.executeCommand('revealInExplorer', await expandTarget(cwd));
-  await vscode.commands.executeCommand('revealInExplorer', cwd);
-  if (followConfig().get('restoreTerminalFocus', true)) {
+  const target = await expandTarget(resolved.cwd);
+  if (generation !== followGeneration) {
+    return;
+  }
+  await vscode.commands.executeCommand('revealInExplorer', target);
+  await vscode.commands.executeCommand('revealInExplorer', resolved.cwd);
+  if (followConfig().get('restoreTerminalFocus', true) && generation === followGeneration) {
     terminal.show();
   }
 }
@@ -137,15 +171,18 @@ async function addWorktreesToWorkspace() {
     return;
   }
 
-  const known = new Set(folders.map((f) => f.uri.fsPath));
+  // Compare normalized Uris, not raw paths: on Windows git emits forward
+  // slashes while fsPath uses backslashes, and one duplicate would make
+  // updateWorkspaceFolders reject the whole batch.
+  const known = new Set(folders.map((f) => f.uri.toString()));
   const discovered = new Set();
   for (const folder of folders) {
     for (const worktree of await listWorktrees(folder)) {
-      discovered.add(worktree);
+      discovered.add(vscode.Uri.file(worktree).toString());
     }
   }
 
-  const toAdd = [...discovered].filter((p) => !known.has(p));
+  const toAdd = [...discovered].filter((uri) => !known.has(uri));
   if (toAdd.length === 0) {
     vscode.window.showInformationMessage('All worktrees are already workspace folders.');
     return;
@@ -154,7 +191,10 @@ async function addWorktreesToWorkspace() {
   vscode.workspace.updateWorkspaceFolders(
     folders.length,
     0,
-    ...toAdd.map((p) => ({ uri: vscode.Uri.file(p), name: path.basename(p) }))
+    ...toAdd.map((uri) => {
+      const parsed = vscode.Uri.parse(uri);
+      return { uri: parsed, name: path.basename(parsed.fsPath) };
+    })
   );
   vscode.window.showInformationMessage(
     `Added ${toAdd.length} worktree folder${toAdd.length === 1 ? '' : 's'} to the workspace.`
@@ -164,7 +204,7 @@ async function addWorktreesToWorkspace() {
 function activate(context) {
   output = vscode.window.createOutputChannel('Worktree Terminal Follow');
   context.subscriptions.push(output);
-  log('activated');
+  log(`activated v${context.extension.packageJSON.version}`);
 
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTerminal((terminal) => {
