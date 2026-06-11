@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Diagnostics: log every raw terminal event (active-terminal change, shell-integration update, open/close) and dump workspace folders, terminals, and the active terminal at activation.
+
 ## 0.1.2
 
 - Fix: resolve the workspace folder by explicit longest-prefix match (case-folded on macOS/Windows, root-folder safe) so nested worktree roots (e.g. `<repo>/.worktrees/*`) win over the containing repo root.

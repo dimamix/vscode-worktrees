@@ -296,18 +296,37 @@ async function addWorktreesToWorkspace() {
 function activate(context) {
   output = vscode.window.createOutputChannel('Worktree Terminal Follow');
   context.subscriptions.push(output);
-  log(`activated v${context.extension.packageJSON.version}`);
+  log(`activated v${context.extension.packageJSON.version} (VS Code ${vscode.version})`);
+  log(
+    'workspace folders: ' +
+      ((vscode.workspace.workspaceFolders || [])
+        .map((f) => `"${f.name}" ${f.uri.fsPath}`)
+        .join(', ') || '(none)')
+  );
+  log(
+    `terminals: ${vscode.window.terminals.map((t) => `"${t.name}"`).join(', ') || '(none)'}` +
+      `; active: ${vscode.window.activeTerminal ? `"${vscode.window.activeTerminal.name}"` : '(none)'}`
+  );
 
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTerminal((terminal) => {
+      log(`event: active terminal changed -> ${terminal ? `"${terminal.name}"` : '(none)'}`);
       followTerminal(terminal, 'active terminal changed');
     }),
     // Catches the cwd becoming available right after a terminal opens, and
     // `cd` between worktrees inside an already-active terminal.
     vscode.window.onDidChangeTerminalShellIntegration((event) => {
-      if (event.terminal === vscode.window.activeTerminal) {
+      const active = event.terminal === vscode.window.activeTerminal;
+      log(`event: shell integration update for "${event.terminal.name}"${active ? ' (active)' : ''}`);
+      if (active) {
         followTerminal(event.terminal, 'shell integration update');
       }
+    }),
+    vscode.window.onDidOpenTerminal((terminal) => {
+      log(`event: terminal opened "${terminal.name}"`);
+    }),
+    vscode.window.onDidCloseTerminal((terminal) => {
+      log(`event: terminal closed "${terminal.name}"`);
     }),
     vscode.commands.registerCommand('worktrees.addWorktreesToWorkspace', addWorktreesToWorkspace)
   );

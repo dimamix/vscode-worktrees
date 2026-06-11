@@ -2,7 +2,7 @@
   "name": "vscode-worktrees",
   "displayName": "Worktree Terminal Follow",
   "description": "Make the Explorer follow the active terminal's git worktree in a multi-root workspace.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "dimamix",
   "license": "MIT",
   "repository": {
