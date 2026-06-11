@@ -45,28 +45,32 @@ async function processCwd(terminal) {
   return undefined;
 }
 
-async function terminalCwd(terminal) {
+// All known cwd sources, most-trustworthy first. The OS leads (shell
+// integration goes stale on revived/TUI terminals), but it reports physical
+// paths — a workspace opened through a symlink only matches the logical path
+// shell integration reports, so the caller tries each in order.
+async function cwdCandidates(terminal) {
+  const candidates = [];
   try {
     const osCwd = await processCwd(terminal);
     if (osCwd) {
-      return { cwd: osCwd, source: 'os' };
+      candidates.push({ cwd: osCwd, source: 'os' });
     }
   } catch (err) {
     log(`OS cwd lookup failed: ${err && err.message}`);
   }
   const integrationCwd = terminal.shellIntegration && terminal.shellIntegration.cwd;
   if (integrationCwd) {
-    return { cwd: integrationCwd, source: 'shell integration' };
+    candidates.push({ cwd: integrationCwd, source: 'shell integration' });
   }
-  // Last resort: the (static) cwd the terminal was created with.
   const created = terminal.creationOptions && terminal.creationOptions.cwd;
   if (created) {
-    return {
+    candidates.push({
       cwd: typeof created === 'string' ? vscode.Uri.file(created) : created,
       source: 'creation options',
-    };
+    });
   }
-  return undefined;
+  return candidates;
 }
 
 // Explicit longest-prefix match over workspace folders. With nested roots —
@@ -122,28 +126,43 @@ async function followTerminal(terminal, reason) {
   if (!terminal || !followConfig().get('enabled', true)) {
     return;
   }
-  const resolved = await terminalCwd(terminal);
+  const candidates = await cwdCandidates(terminal);
   if (generation !== followGeneration) {
     return;
   }
-  if (!resolved) {
+  if (candidates.length === 0) {
     log(`(${reason}) no cwd resolvable for terminal "${terminal.name}"`);
     return;
   }
-  const folder = workspaceFolderFor(resolved.cwd);
-  log(
-    `(${reason}) "${terminal.name}" cwd ${resolved.cwd.fsPath} [${resolved.source}] -> ` +
-      (folder ? `workspace folder "${folder.name}"` : 'no workspace folder')
-  );
+  let folder;
+  let resolved;
+  for (const candidate of candidates) {
+    folder = workspaceFolderFor(candidate.cwd);
+    if (folder) {
+      resolved = candidate;
+      break;
+    }
+  }
   if (!folder) {
+    log(
+      `(${reason}) "${terminal.name}" no candidate cwd inside a workspace folder: ` +
+        candidates.map((c) => `${c.cwd.fsPath} [${c.source}]`).join(', ')
+    );
     return;
   }
+  log(
+    `(${reason}) "${terminal.name}" cwd ${resolved.cwd.fsPath} [${resolved.source}] -> ` +
+      `workspace folder "${folder.name}"`
+  );
   // Re-revealing within the same root would collapse trees the user
   // expanded by hand, so only act when the terminal's root changes.
   if (folder.uri.toString() === lastRevealedFolder) {
     log(`(${reason}) already on "${folder.name}"; nothing to do`);
     return;
   }
+  // Cleared for the whole mutation: if this invocation is superseded
+  // half-done, the guard must not claim the reveal happened.
+  lastRevealedFolder = undefined;
 
   if (followConfig().get('collapseOthers', true)) {
     await vscode.commands.executeCommand('workbench.files.action.collapseExplorerFolders');
