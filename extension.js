@@ -73,12 +73,22 @@ async function terminalCwd(terminal) {
 // a repo plus its worktrees under <repo>/.worktrees/ — the innermost folder
 // must win, and this must not depend on getWorkspaceFolder's tie-breaking.
 function workspaceFolderFor(uri) {
-  const target = uri.fsPath + path.sep;
+  // Trailing separator prevents /a/b matching /a/bc; roots like / or C:\
+  // already end with one. macOS and Windows filesystems are case-insensitive
+  // by default, so compare case-folded there.
+  const normalize = (p) => {
+    const cased =
+      process.platform === 'darwin' || process.platform === 'win32' ? p.toLowerCase() : p;
+    return cased.endsWith(path.sep) ? cased : cased + path.sep;
+  };
+  const target = normalize(uri.fsPath);
   let best;
+  let bestLength = -1;
   for (const folder of vscode.workspace.workspaceFolders || []) {
-    const prefix = folder.uri.fsPath + path.sep;
-    if (target.startsWith(prefix) && (!best || prefix.length > best.uri.fsPath.length + 1)) {
+    const prefix = normalize(folder.uri.fsPath);
+    if (target.startsWith(prefix) && prefix.length > bestLength) {
       best = folder;
+      bestLength = prefix.length;
     }
   }
   return best;
@@ -131,7 +141,6 @@ async function followTerminal(terminal, reason) {
     log(`(${reason}) already on "${folder.name}"; nothing to do`);
     return;
   }
-  lastRevealedFolder = folder.uri.toString();
 
   if (followConfig().get('collapseOthers', true)) {
     await vscode.commands.executeCommand('workbench.files.action.collapseExplorerFolders');
@@ -142,6 +151,9 @@ async function followTerminal(terminal, reason) {
   }
   await vscode.commands.executeCommand('revealInExplorer', target);
   await vscode.commands.executeCommand('revealInExplorer', resolved.cwd);
+  // Recorded only after the reveal really happened — a canceled invocation
+  // must not suppress the next switch back to this folder.
+  lastRevealedFolder = folder.uri.toString();
   if (followConfig().get('restoreTerminalFocus', true) && generation === followGeneration) {
     terminal.show();
   }
