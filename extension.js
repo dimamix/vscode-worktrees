@@ -56,14 +56,28 @@ async function processCwd(terminal) {
 // shells. The OS cwd covers terminals where integration never attached and
 // is consulted whenever integration maps outside every workspace folder;
 // the static creation cwd is the last resort.
-async function cwdCandidates(terminal) {
+const osCwdCache = new WeakMap();
+
+// TTL-cached OS lookup so idle polls don't spawn a process per tick;
+// callers needing a fresh answer pass maxAgeMs 0.
+async function processCwdCached(terminal, maxAgeMs) {
+  const cached = osCwdCache.get(terminal);
+  if (cached && maxAgeMs > 0 && Date.now() - cached.at < maxAgeMs) {
+    return cached.cwd;
+  }
+  const cwd = await processCwd(terminal);
+  osCwdCache.set(terminal, { cwd, at: Date.now() });
+  return cwd;
+}
+
+async function cwdCandidates(terminal, osMaxAgeMs) {
   const candidates = [];
   const integrationCwd = terminal.shellIntegration && terminal.shellIntegration.cwd;
   if (integrationCwd) {
     candidates.push({ cwd: integrationCwd, source: 'shell integration' });
   }
   try {
-    const osCwd = await processCwd(terminal);
+    const osCwd = await processCwdCached(terminal, osMaxAgeMs || 0);
     if (osCwd) {
       candidates.push({ cwd: osCwd, source: 'os' });
     }
@@ -126,19 +140,46 @@ async function expandTarget(cwd) {
   return cwd;
 }
 
-async function followTerminal(terminal, reason) {
+async function followTerminal(terminal, reason, quiet, forceFreshOsCwd) {
   // Bump first even when bailing: switching to "no terminal" must cancel
   // any follow still in flight for a previous terminal.
   const generation = ++followGeneration;
   if (!terminal || !followConfig().get('enabled', true)) {
     return;
   }
-  const candidates = await cwdCandidates(terminal);
-  if (generation !== followGeneration) {
+  // Without reliable events, nothing bumps the generation when the user
+  // switches mid-await — so staleness also means "no longer the active
+  // terminal", or a stale poll would reveal and refocus the old one.
+  const stillCurrent = () =>
+    generation === followGeneration && terminal === vscode.window.activeTerminal;
+  // Spawn-free fast path for idle polls: if shell integration's cwd maps to
+  // the folder we already revealed, nothing changed. Skipped right after a
+  // terminal switch — integration's claim must be verified against the OS
+  // then, or a stale value could pin us to the wrong folder forever.
+  if (quiet && !forceFreshOsCwd) {
+    const integrationCwd = terminal.shellIntegration && terminal.shellIntegration.cwd;
+    if (integrationCwd) {
+      const quickFolder = workspaceFolderFor(integrationCwd);
+      if (quickFolder && quickFolder.uri.toString() === lastRevealedFolder) {
+        return;
+      }
+    }
+  }
+  let candidates = await cwdCandidates(terminal, quiet && !forceFreshOsCwd ? 10000 : 0);
+  if (!stillCurrent()) {
     return;
   }
+  // Known theoretical limitation, deliberately unhandled: if shell
+  // integration ever reported a stale cwd indefinitely, it would be
+  // followed until the next prompt render. This has not been observed in
+  // practice (revived terminals report a correct value or none), and the
+  // machinery to second-guess it provably misfires on nested shells.
+  // Every decision logs its source, so real-world staleness would be
+  // visible in the output channel — handle it when it's ever seen.
   if (candidates.length === 0) {
-    log(`(${reason}) no cwd resolvable for terminal "${terminal.name}"`);
+    if (!quiet) {
+      log(`(${reason}) no cwd resolvable for terminal "${terminal.name}"`);
+    }
     return;
   }
   // Candidates group by the physical directory they name; groups keep
@@ -187,21 +228,30 @@ async function followTerminal(terminal, reason) {
     }
   }
   if (!folder) {
-    log(
-      `(${reason}) "${terminal.name}" no candidate cwd inside a workspace folder: ` +
-        candidates.map((c) => `${c.cwd.fsPath} [${c.source}]`).join(', ')
-    );
+    if (!quiet) {
+      log(
+        `(${reason}) "${terminal.name}" no candidate cwd inside a workspace folder: ` +
+          candidates.map((c) => `${c.cwd.fsPath} [${c.source}]`).join(', ')
+      );
+    }
     return;
   }
-  log(
+  const resolutionLine =
     `(${reason}) "${terminal.name}" cwd ${resolved.cwd.fsPath} [${resolved.source}] -> ` +
-      `workspace folder "${folder.name}"`
-  );
+    `workspace folder "${folder.name}"`;
+  if (!quiet) {
+    log(resolutionLine);
+  }
   // Re-revealing within the same root would collapse trees the user
   // expanded by hand, so only act when the terminal's root changes.
   if (folder.uri.toString() === lastRevealedFolder) {
-    log(`(${reason}) already on "${folder.name}"; nothing to do`);
+    if (!quiet) {
+      log(`(${reason}) already on "${folder.name}"; nothing to do`);
+    }
     return;
+  }
+  if (quiet) {
+    log(resolutionLine);
   }
   // Cleared for the whole mutation: if this invocation is superseded
   // half-done, the guard must not claim the reveal happened.
@@ -211,15 +261,15 @@ async function followTerminal(terminal, reason) {
     await vscode.commands.executeCommand('workbench.files.action.collapseExplorerFolders');
   }
   const target = await expandTarget(resolved.cwd);
-  if (generation !== followGeneration) {
+  if (!stillCurrent()) {
     return;
   }
   await vscode.commands.executeCommand('revealInExplorer', target);
-  if (generation !== followGeneration) {
+  if (!stillCurrent()) {
     return;
   }
   await vscode.commands.executeCommand('revealInExplorer', resolved.cwd);
-  if (generation !== followGeneration) {
+  if (!stillCurrent()) {
     return;
   }
   // Recorded only after the reveal really happened — a canceled invocation
@@ -330,6 +380,40 @@ function activate(context) {
     }),
     vscode.commands.registerCommand('worktrees.addWorktreesToWorkspace', addWorktreesToWorkspace)
   );
+
+  // Event delivery has been observed to silently fail for terminal
+  // switches in some windows; the poll is the dependable path and the
+  // same-folder guard keeps it idle until the worktree actually changes.
+  // Clamp: below ~500ms polling gets aggressive, and beyond Node's max
+  // timer delay (2^31-1 ms) setInterval overflows to ~1ms.
+  const pollIntervalMs = Math.min(
+    Math.max(followConfig().get('pollIntervalMs', 2000), 500),
+    2147483647
+  );
+  if (followConfig().get('pollIntervalMs', 2000) > 0) {
+    // A tick must not cancel a still-running follow (each call bumps the
+    // generation), or a follow slower than the interval would never finish.
+    let pollInFlight = false;
+    let lastPolledTerminal;
+    const pollTimer = setInterval(() => {
+      if (pollInFlight) {
+        return;
+      }
+      pollInFlight = true;
+      const terminal = vscode.window.activeTerminal;
+      // The OS-cwd cache only smooths repeat checks of the SAME terminal;
+      // a just-switched-to terminal always gets a fresh lookup.
+      const freshlySwitched = terminal !== lastPolledTerminal;
+      lastPolledTerminal = terminal;
+      Promise.resolve(followTerminal(terminal, 'poll', true, freshlySwitched))
+        .catch((err) => log(`poll follow failed: ${err && err.message}`))
+        .finally(() => {
+          pollInFlight = false;
+        });
+    }, pollIntervalMs);
+    context.subscriptions.push({ dispose: () => clearInterval(pollTimer) });
+    log(`polling active terminal every ${pollIntervalMs}ms`);
+  }
 
   followTerminal(vscode.window.activeTerminal, 'startup');
 }

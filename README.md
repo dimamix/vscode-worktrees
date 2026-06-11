@@ -40,6 +40,11 @@ Click a terminal, watch the Explorer follow.
 - VS Code **1.93+**.
 - **Terminal shell integration** must be active (it is by default for bash/zsh/fish/pwsh). If `terminal.integrated.shellIntegration.enabled` is `false`, or your prompt setup breaks the injection, the extension can't see the terminal's cwd and does nothing. Quick check: if your terminal tab titles show the current folder name, shell integration is working.
 
+## Known limitations
+
+- **Polling fallback.** VS Code's `onDidChangeActiveTerminal` event has been observed to silently not fire in some windows (e.g. with terminals revived by persistent sessions after a window reload — the renderer→extension-host terminal sync can drop instances, and the event is then swallowed without an error). The extension therefore also polls the active terminal (`worktrees.follow.pollIntervalMs`, default 2s; `0` disables). Idle polls are spawn-free when shell integration is available. Polling is a workaround, not a position: if the events work in your window, they take effect immediately and the poll never does anything.
+- **Stale shell integration is trusted.** If shell integration ever reported an out-of-date directory indefinitely, the extension would follow it until the shell next renders a prompt. This hasn't been observed in practice; the output channel logs the source of every decision, so it would be visible if it occurred.
+
 ## Install
 
 Not on the Marketplace (yet). Build the VSIX with the shell script and install it:
