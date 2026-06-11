@@ -1,0 +1,57 @@
+{
+  "name": "vscode-worktrees",
+  "displayName": "Worktree Terminal Follow",
+  "description": "Make the Explorer follow the active terminal's git worktree in a multi-root workspace.",
+  "version": "0.1.0",
+  "publisher": "dimamix",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dimamix/vscode-worktrees.git"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "git",
+    "worktree",
+    "terminal",
+    "explorer",
+    "multi-root"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "worktrees.addWorktreesToWorkspace",
+        "title": "Worktrees: Add Git Worktrees as Workspace Folders"
+      }
+    ],
+    "configuration": {
+      "title": "Worktree Terminal Follow",
+      "properties": {
+        "worktrees.follow.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reveal the active terminal's workspace folder in the Explorer when switching terminals or changing directories."
+        },
+        "worktrees.follow.collapseOthers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Collapse all Explorer folders before revealing the active terminal's folder."
+        },
+        "worktrees.follow.restoreTerminalFocus": {
+          "type": "boolean",
+          "default": true,
+          "description": "Return focus to the terminal after revealing the folder in the Explorer."
+        }
+      }
+    }
+  }
+}
