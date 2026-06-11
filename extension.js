@@ -7,24 +7,92 @@ const path = require('path');
 
 const execFileAsync = promisify(execFile);
 
+let output;
 let lastRevealedFolder;
+
+function log(message) {
+  if (output) {
+    output.appendLine(`[${new Date().toISOString()}] ${message}`);
+  }
+}
 
 function followConfig() {
   return vscode.workspace.getConfiguration('worktrees.follow');
 }
 
-async function followTerminal(terminal) {
-  if (!followConfig().get('enabled', true)) {
+// The shell's cwd as the OS sees it. Works even when shell integration is
+// silent (e.g. a TUI has been running since before integration attached).
+async function processCwd(terminal) {
+  const pid = await terminal.processId;
+  if (!pid) {
+    return undefined;
+  }
+  if (process.platform === 'linux') {
+    const { stdout } = await execFileAsync('readlink', ['-f', `/proc/${pid}/cwd`]);
+    return vscode.Uri.file(stdout.trim());
+  }
+  if (process.platform === 'darwin') {
+    const { stdout } = await execFileAsync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn']);
+    const line = stdout.split('\n').find((l) => l.startsWith('n'));
+    if (line) {
+      return vscode.Uri.file(line.slice(1));
+    }
+  }
+  return undefined;
+}
+
+async function terminalCwd(terminal) {
+  const integrationCwd = terminal.shellIntegration && terminal.shellIntegration.cwd;
+  if (integrationCwd) {
+    return integrationCwd;
+  }
+  log('shell integration cwd unavailable; querying the OS');
+  try {
+    const osCwd = await processCwd(terminal);
+    if (osCwd) {
+      return osCwd;
+    }
+  } catch (err) {
+    log(`OS cwd lookup failed: ${err && err.message}`);
+  }
+  // Last resort: the (static) cwd the terminal was created with.
+  const created = terminal.creationOptions && terminal.creationOptions.cwd;
+  if (created) {
+    return typeof created === 'string' ? vscode.Uri.file(created) : created;
+  }
+  return undefined;
+}
+
+// Revealing a folder only selects it; revealing something inside it is what
+// forces the Explorer to expand the chain down to the cwd.
+async function expandTarget(cwd) {
+  try {
+    const entries = await vscode.workspace.fs.readDirectory(cwd);
+    const visible = entries
+      .map(([name]) => name)
+      .filter((name) => !name.startsWith('.'))
+      .sort();
+    if (visible.length > 0) {
+      return vscode.Uri.joinPath(cwd, visible[0]);
+    }
+  } catch (err) {
+    log(`readDirectory failed for ${cwd.fsPath}: ${err && err.message}`);
+  }
+  return cwd;
+}
+
+async function followTerminal(terminal, reason) {
+  if (!followConfig().get('enabled', true) || !terminal) {
     return;
   }
-  // Provided by VS Code shell integration; undefined until integration
-  // attaches (a moment after the terminal opens) or if it's disabled.
-  const cwd = terminal && terminal.shellIntegration && terminal.shellIntegration.cwd;
+  const cwd = await terminalCwd(terminal);
   if (!cwd) {
+    log(`(${reason}) no cwd resolvable for terminal "${terminal.name}"`);
     return;
   }
   const folder = vscode.workspace.getWorkspaceFolder(cwd);
   if (!folder) {
+    log(`(${reason}) cwd ${cwd.fsPath} is not inside any workspace folder`);
     return;
   }
   // Re-revealing within the same root would collapse trees the user
@@ -33,12 +101,14 @@ async function followTerminal(terminal) {
     return;
   }
   lastRevealedFolder = folder.uri.toString();
+  log(`(${reason}) cwd ${cwd.fsPath} -> revealing workspace folder "${folder.name}"`);
 
   if (followConfig().get('collapseOthers', true)) {
     await vscode.commands.executeCommand('workbench.files.action.collapseExplorerFolders');
   }
+  await vscode.commands.executeCommand('revealInExplorer', await expandTarget(cwd));
   await vscode.commands.executeCommand('revealInExplorer', cwd);
-  if (followConfig().get('restoreTerminalFocus', true) && terminal) {
+  if (followConfig().get('restoreTerminalFocus', true)) {
     terminal.show();
   }
 }
@@ -92,21 +162,25 @@ async function addWorktreesToWorkspace() {
 }
 
 function activate(context) {
+  output = vscode.window.createOutputChannel('Worktree Terminal Follow');
+  context.subscriptions.push(output);
+  log('activated');
+
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTerminal((terminal) => {
-      followTerminal(terminal);
+      followTerminal(terminal, 'active terminal changed');
     }),
     // Catches the cwd becoming available right after a terminal opens, and
     // `cd` between worktrees inside an already-active terminal.
     vscode.window.onDidChangeTerminalShellIntegration((event) => {
       if (event.terminal === vscode.window.activeTerminal) {
-        followTerminal(event.terminal);
+        followTerminal(event.terminal, 'shell integration update');
       }
     }),
     vscode.commands.registerCommand('worktrees.addWorktreesToWorkspace', addWorktreesToWorkspace)
   );
 
-  followTerminal(vscode.window.activeTerminal);
+  followTerminal(vscode.window.activeTerminal, 'startup');
 }
 
 function deactivate() {}
