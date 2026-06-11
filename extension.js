@@ -75,7 +75,8 @@ async function terminalCwd(terminal) {
 function workspaceFolderFor(uri) {
   // Trailing separator prevents /a/b matching /a/bc; roots like / or C:\
   // already end with one. macOS and Windows filesystems are case-insensitive
-  // by default, so compare case-folded there.
+  // by default, so compare case-folded there. Known trade-off: on an opt-in
+  // case-SENSITIVE volume, sibling folders differing only by case conflate.
   const normalize = (p) => {
     const cased =
       process.platform === 'darwin' || process.platform === 'win32' ? p.toLowerCase() : p;
@@ -115,10 +116,12 @@ async function expandTarget(cwd) {
 }
 
 async function followTerminal(terminal, reason) {
+  // Bump first even when bailing: switching to "no terminal" must cancel
+  // any follow still in flight for a previous terminal.
+  const generation = ++followGeneration;
   if (!terminal || !followConfig().get('enabled', true)) {
     return;
   }
-  const generation = ++followGeneration;
   const resolved = await terminalCwd(terminal);
   if (generation !== followGeneration) {
     return;
@@ -150,11 +153,17 @@ async function followTerminal(terminal, reason) {
     return;
   }
   await vscode.commands.executeCommand('revealInExplorer', target);
+  if (generation !== followGeneration) {
+    return;
+  }
   await vscode.commands.executeCommand('revealInExplorer', resolved.cwd);
+  if (generation !== followGeneration) {
+    return;
+  }
   // Recorded only after the reveal really happened — a canceled invocation
   // must not suppress the next switch back to this folder.
   lastRevealedFolder = folder.uri.toString();
-  if (followConfig().get('restoreTerminalFocus', true) && generation === followGeneration) {
+  if (followConfig().get('restoreTerminalFocus', true)) {
     terminal.show();
   }
 }
